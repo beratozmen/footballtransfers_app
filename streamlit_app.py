@@ -1,103 +1,137 @@
 import streamlit as st
-import requests
-from bs4 import BeautifulSoup
 import pandas as pd
+import plotly.express as px
+import kagglehub
+from kagglehub import KaggleDatasetAdapter
 
-@st.cache_data(show_spinner=False)
-def transfer_history(player_url):
-    # Extract the player ID from the URL.
-    try:
-        playerid = player_url.split("spieler/")[1]
-    except IndexError:
-        st.error("The URL does not seem to be a valid Transfermarkt player URL.")
-        return pd.DataFrame()
+st.title("Team Total Transfer Fees Analysis")
+
+# --------------------------------------------------------------------
+# DATA LOADING: Download all datasets via KaggleHub
+# --------------------------------------------------------------------
+@st.cache_data
+def load_all_datasets():
+    # List of filenames to load from the dataset
+    file_names = [
+        "game_lineups.csv",
+        "competitions.csv",
+        "appearances.csv",
+        "player_valuations.csv",
+        "game_events.csv",
+        "transfers.csv",
+        "players.csv",
+        "games.csv",
+        "club_games.csv",
+        "clubs.csv"
+    ]
     
-    headers = {
-        'User-Agent': (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) '
-            'Chrome/90.0.4430.212 Safari/537.36'
+    data = {}
+    for file in file_names:
+        # Load each CSV file as a Pandas DataFrame
+        data[file] = kagglehub.load_dataset(
+            KaggleDatasetAdapter.PANDAS,
+            "davidcariboo/player-scores",
+            file,
+            pandas_kwargs={}
         )
-    }
-    
-    try:
-        r = requests.get(player_url, headers=headers, timeout=1000)
-    except Exception as e:
-        st.error(f"Error fetching the URL: {e}")
-        return pd.DataFrame()
-    
-    soup = BeautifulSoup(r.content, "html.parser")
-    
-    # Get the player's name from the header.
-    try:
-        name = soup.find("h1").get_text().strip()
-    except Exception as e:
-        st.error("Could not extract the player's name.")
-        return pd.DataFrame()
-    
-    # Try to locate the transfer history table by scanning all divs with class "responsive-table".
-    table_divs = soup.find_all("div", class_="responsive-table")
-    transfer_table = None
-    for div in table_divs:
-        table = div.find("table")
-        if table and ("Sezon" in table.get_text() or "Season" in table.get_text()):
-            transfer_table = table
-            break
-    
-    if transfer_table is None:
-        st.error("Could not find the transfer history table. The page structure may have changed.")
-        return pd.DataFrame()
-    
-    try:
-        df_list = pd.read_html(str(transfer_table))
-        if not df_list:
-            st.error("No table data found on the page.")
-            return pd.DataFrame()
-        temp = df_list[0]
-    except Exception as e:
-        st.error(f"Error reading the table: {e}")
-        return pd.DataFrame()
-    
-    # Clean the data by removing summary rows and unnecessary columns.
-    try:
-        temp = temp[temp.Sezon != "Toplam transfer kazancı :"]
-    except Exception:
-        pass  # If the column isn't present, continue.
-    
-    drop_cols = ["Unnamed: 10", "Veren kulüp", "Veren kulüp.1", "Alan kulüp", "Alan kulüp.1"]
-    for col in drop_cols:
-        if col in temp.columns:
-            temp = temp.drop(col, axis=1)
-    temp = temp.rename(columns={"Veren kulüp.2": "VerenKulup", "Alan kulüp.2": "AlanKulup"})
-    temp["TMId"] = playerid
-    temp["Player"] = name
-    return temp
+    return data
 
-def main():
-    st.title("Transfermarkt: Player Transfer History")
-    st.markdown("""
-    This demo shows how to scrape a player's transfer history from Transfermarkt.
-    
-    **Note:** The full team-level analysis would involve scraping:
-    - League URLs for your season(s) of interest
-    - Team URLs from those leagues
-    - Player URLs from a chosen team
-    - Then aggregating the transfer history of each player
-    
-    The code below focuses on a single player (using Mesut Özil’s profile as an example) for clarity.
-    """)
-    
-    default_url = "https://www.transfermarkt.com.tr/mesut-ozil/profil/spieler/35664"
-    player_url = st.text_input("Enter a Transfermarkt player URL:", default_url)
-    
-    if st.button("Get Transfer History"):
-        with st.spinner("Fetching transfer history data..."):
-            df_transfer = transfer_history(player_url)
-        if not df_transfer.empty:
-            st.success("Transfer history data fetched successfully!")
-            st.dataframe(df_transfer)
+data = load_all_datasets()
+
+# --------------------------------------------------------------------
+# Helper function to convert season strings to full starting year
+# --------------------------------------------------------------------
+def season_to_year(season_str):
+    """
+    Converts a season string in the format "YY/YY" to a full year.
+    Assumes that if the starting number is <= 50, then it is 2000+value,
+    otherwise it is 1900+value.
+    For example:
+      "93/94" -> 1993
+      "10/11" -> 2010
+    """
+    try:
+        parts = season_str.split("/")
+        start = int(parts[0])
+        if start <= 50:
+            full_year = 2000 + start
         else:
-            st.error("No transfer history data could be retrieved. Check the URL or try again.")
+            full_year = 1900 + start
+        return full_year
+    except Exception as e:
+        return 0  # fallback if conversion fails
 
-if __name__ == "__main__":
-    main()
+# --------------------------------------------------------------------
+# FILTERING & AGGREGATION: Total Transfer Fees with Season and Team Filters
+# --------------------------------------------------------------------
+# Get the transfers DataFrame from the loaded datasets
+transfers_df = data["transfers.csv"].copy()
+
+# Convert the transfer_fee column to numeric
+transfers_df["transfer_fee"] = pd.to_numeric(transfers_df["transfer_fee"], errors="coerce")
+
+# Filter out rows with missing transfer_season
+transfers_df = transfers_df.dropna(subset=["transfer_season"])
+
+# Filter out seasons before 10/11 (i.e. before 2010)
+transfers_df = transfers_df[transfers_df["transfer_season"].apply(season_to_year) >= 2010]
+
+# Create the Season filter dropdown (with "All Seasons" option)
+seasons = sorted(transfers_df["transfer_season"].unique())
+selected_season = st.selectbox("Select Season", ["All Seasons"] + seasons)
+
+# Create the Team filter dropdown (with "All Teams" option)
+teams = sorted(transfers_df["to_club_name"].dropna().unique())
+selected_team = st.selectbox("Select Team", ["All Teams"] + teams)
+
+# Only proceed if at least one filter is specific
+if selected_season == "All Seasons" and selected_team == "All Teams":
+    st.write("Please select a specific Season or a specific Team to view the data.")
+else:
+    df_filtered = transfers_df.copy()
+    
+    if selected_season != "All Seasons":
+        df_filtered = df_filtered[df_filtered["transfer_season"] == selected_season]
+        
+    if selected_team != "All Teams":
+        df_filtered = df_filtered[df_filtered["to_club_name"].str.contains(selected_team, case=False, na=False)]
+    
+    # Drop rows with missing transfer fees
+    df_filtered = df_filtered.dropna(subset=["transfer_fee"])
+    
+    # Scenario 1: Specific Team and All Seasons → Group by Season for that team.
+    if selected_team != "All Teams" and selected_season == "All Seasons":
+        grouped = df_filtered.groupby("transfer_season")["transfer_fee"].sum().reset_index()
+        x_col = "transfer_season"
+        chart_title = f"Total Transfer Fees by Season for {selected_team}"
+        
+        fig = px.bar(
+            grouped,
+            x=x_col,
+            y="transfer_fee",
+            labels={x_col: "Season", "transfer_fee": "Total Transfer Fees (EUR)"},
+            title=chart_title
+        )
+        fig.update_layout(xaxis_tickangle=-45)
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # Scenario 2: Specific Season and All Teams → Group by Team for that season.
+    elif selected_team == "All Teams" and selected_season != "All Seasons":
+        grouped = df_filtered.groupby("to_club_name")["transfer_fee"].sum().reset_index()
+        x_col = "to_club_name"
+        chart_title = f"Total Transfer Fees for Teams in {selected_season}"
+        
+        fig = px.bar(
+            grouped,
+            x=x_col,
+            y="transfer_fee",
+            labels={x_col: "Team", "transfer_fee": "Total Transfer Fees (EUR)"},
+            title=chart_title
+        )
+        fig.update_layout(xaxis_tickangle=-45)
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # Scenario 3: Both specific Team and specific Season → Display total fee as text.
+    else:
+        total_fee = df_filtered["transfer_fee"].sum()
+        st.write(f"Total Transfer Fees for {selected_team} in {selected_season}: EUR {total_fee:,.2f}")

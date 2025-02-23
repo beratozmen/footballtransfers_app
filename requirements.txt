@@ -1,2 +1,8 @@
 streamlit
-bs4
+pandas
+kaggle
+kagglehub
+numpy
+matplotlib
+seaborn
+plotly
